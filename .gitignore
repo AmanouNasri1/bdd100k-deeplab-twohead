@@ -1,0 +1,15 @@
+# data/artifacts (never commit)
+data/
+artifacts/
+runs/
+results/
+*.onnx
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# misc
+.DS_Store
