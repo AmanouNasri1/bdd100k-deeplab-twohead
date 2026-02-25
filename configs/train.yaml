@@ -2,28 +2,19 @@ seed: 42
 
 data:
   prepared_root: /content/drive/MyDrive/bdd100k/prepared_360x640
-  img_size: [360, 640]     # H,W
+  img_size: [360, 640]
   num_workers: 2
-
-model:
-  pretrained: true
-  num_classes_drivable: 3
-  num_classes_lane: 2
+  ignore_index: 255
+  num_classes_semantic: 19
+  num_classes_drivable: 2
 
 train:
-  epochs: 50
-  batch_size: 8          # if OOM -> 4
+  epochs: 40
+  batch_size: 8
   lr: 0.0003
   weight_decay: 0.0001
   amp: true
   grad_accum_steps: 1
-  val_every: 1
-
-loss:
-  lane_pos_weight: 4.0
-  drivable_ce_weight: [1.0, 1.0, 1.0]
-
-checkpoint:
   save_every_steps: 500
-  keep_epoch_ckpts: true
-  metric: val_mean_iou
+  val_every: 1
+  best_metric: val_score

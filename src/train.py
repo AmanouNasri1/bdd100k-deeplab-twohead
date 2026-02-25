@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
-from src.data.prepared_bdd100k import PreparedBDD100K
+from src.data.prepared_bdd100k_seg import PreparedBDD100KSeg
 from src.models.deeplab_two_head import DeepLabV3TwoHead
 from src.eval import evaluate
 
@@ -28,8 +28,12 @@ def main(cfg, run_dir, resume: bool):
     H, W = cfg["data"]["img_size"]
     prep = cfg["data"]["prepared_root"]
 
-    ds_train = PreparedBDD100K(prep, "train", (H, W))
-    ds_val   = PreparedBDD100K(prep, "val", (H, W))
+    ignore = int(cfg["data"]["ignore_index"])
+    num_sem = int(cfg["data"]["num_classes_semantic"])
+    num_drv = int(cfg["data"]["num_classes_drivable"])
+
+    ds_train = PreparedBDD100KSeg(prep, "train", (H, W), augment=True)
+    ds_val   = PreparedBDD100KSeg(prep, "val", (H, W), augment=False)
 
     dl_train = DataLoader(ds_train, batch_size=cfg["train"]["batch_size"], shuffle=True,
                           num_workers=cfg["data"]["num_workers"], pin_memory=True)
@@ -37,16 +41,14 @@ def main(cfg, run_dir, resume: bool):
                         num_workers=cfg["data"]["num_workers"], pin_memory=True)
 
     model = DeepLabV3TwoHead(
-        pretrained=cfg["model"]["pretrained"],
-        num_drivable=cfg["model"]["num_classes_drivable"],
-        num_lane=cfg["model"]["num_classes_lane"],
+        pretrained=True,
+        num_semantic=num_sem,
+        num_drivable=num_drv,
     ).to(device)
 
-    drv_w = torch.tensor(cfg["loss"]["drivable_ce_weight"], dtype=torch.float32, device=device)
-    loss_drv = nn.CrossEntropyLoss(weight=drv_w)
-
-    lane_w = torch.tensor([1.0, float(cfg["loss"]["lane_pos_weight"])], dtype=torch.float32, device=device)
-    loss_lane = nn.CrossEntropyLoss(weight=lane_w)
+    # Losses: ignore 255 regions
+    loss_sem = nn.CrossEntropyLoss(ignore_index=ignore)
+    loss_drv = nn.CrossEntropyLoss(ignore_index=ignore)
 
     optim = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"], weight_decay=cfg["train"]["weight_decay"])
     scaler = GradScaler(enabled=cfg["train"]["amp"])
@@ -72,10 +74,9 @@ def main(cfg, run_dir, resume: bool):
     if not os.path.exists(metrics_csv):
         with open(metrics_csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["epoch", "train_loss", "val_iou_drivable", "val_iou_lane", "val_mean_iou", "best_so_far"])
+            w.writerow(["epoch", "train_loss", "val_miou_sem", "val_iou_drv1", "val_score", "best_so_far"])
 
-    save_every = int(cfg["checkpoint"]["save_every_steps"])
-    keep_epoch_ckpts = bool(cfg["checkpoint"]["keep_epoch_ckpts"])
+    save_every = int(cfg["train"]["save_every_steps"])
 
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
         model.train()
@@ -85,16 +86,18 @@ def main(cfg, run_dir, resume: bool):
         optim.zero_grad(set_to_none=True)
         pbar = tqdm(dl_train, desc=f"epoch {epoch}", leave=False)
 
-        for imgs, drv_gt, lane_gt, _ in pbar:
+        for imgs, sem_gt, drv_gt, _ in pbar:
             imgs = imgs.to(device, non_blocking=True)
+            sem_gt = sem_gt.to(device, non_blocking=True)
             drv_gt = drv_gt.to(device, non_blocking=True)
-            lane_gt = lane_gt.to(device, non_blocking=True)
 
             with autocast(enabled=cfg["train"]["amp"]):
                 out = model(imgs)
-                l1 = loss_drv(out["drivable"], drv_gt)
-                l2 = loss_lane(out["lane"], lane_gt)
-                loss = l1 + l2
+                l_sem = loss_sem(out["semantic"], sem_gt)
+                l_drv = loss_drv(out["drivable"], drv_gt)
+
+                # drivable task is easier; give it lower weight
+                loss = l_sem + 0.5 * l_drv
 
             scaler.scale(loss).backward()
 
@@ -121,12 +124,13 @@ def main(cfg, run_dir, resume: bool):
 
         train_loss = running / max(n, 1)
 
-        val = evaluate(model, dl_val, device,
-                       cfg["model"]["num_classes_drivable"],
-                       cfg["model"]["num_classes_lane"])
+        val = evaluate(model, dl_val, device, num_sem, num_drv, ignore)
 
-        if val["val_mean_iou"] > best_metric:
-            best_metric = val["val_mean_iou"]
+        metric_name = cfg["train"]["best_metric"]
+        metric = float(val[metric_name])
+
+        if metric > best_metric:
+            best_metric = metric
             save_ckpt(best_path, {
                 "model": model.state_dict(),
                 "epoch": epoch,
@@ -145,20 +149,11 @@ def main(cfg, run_dir, resume: bool):
             "cfg": cfg,
         })
 
-        if keep_epoch_ckpts:
-            save_ckpt(os.path.join(run_dir, f"epoch_{epoch:03d}.pt"), {
-                "model": model.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "best_metric": best_metric,
-                "cfg": cfg,
-            })
-
         with open(metrics_csv, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([epoch, train_loss, val["val_iou_drivable"], val["val_iou_lane"], val["val_mean_iou"], best_metric])
+            w.writerow([epoch, train_loss, val["val_miou_sem"], val["val_iou_drv1"], val["val_score"], best_metric])
 
-        print(f"[epoch {epoch}] loss={train_loss:.4f} val_mean_iou={val['val_mean_iou']:.4f} best={best_metric:.4f}")
+        print(f"[epoch {epoch}] loss={train_loss:.4f} val={val} best={best_metric:.4f}")
 
 def parse_args():
     ap = argparse.ArgumentParser()

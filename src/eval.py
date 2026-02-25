@@ -1,39 +1,31 @@
 import torch
+from src.metrics import confusion_matrix, miou_from_cm
 
 @torch.no_grad()
-def compute_iou(pred, target, num_classes: int):
-    ious = []
-    for c in range(num_classes):
-        p = (pred == c)
-        t = (target == c)
-        inter = (p & t).sum().item()
-        union = (p | t).sum().item()
-        if union == 0:
-            continue
-        ious.append(inter / union)
-    return sum(ious) / len(ious) if ious else 0.0
-
-@torch.no_grad()
-def evaluate(model, loader, device, num_drivable, num_lane):
+def evaluate(model, loader, device, num_sem, num_drv, ignore_index=255):
     model.eval()
-    drv_ious = []
-    lane_ious = []
+    cm_sem = torch.zeros((num_sem, num_sem), dtype=torch.int64, device=device)
+    cm_drv = torch.zeros((num_drv, num_drv), dtype=torch.int64, device=device)
 
-    for imgs, drv_gt, lane_gt, _ in loader:
+    for imgs, sem_gt, drv_gt, _ in loader:
         imgs = imgs.to(device)
+        sem_gt = sem_gt.to(device)
         drv_gt = drv_gt.to(device)
-        lane_gt = lane_gt.to(device)
 
         out = model(imgs)
-        drv_pred = out["drivable"].argmax(dim=1)
-        lane_pred = out["lane"].argmax(dim=1)
+        sem_pred = out["semantic"].argmax(1)
+        drv_pred = out["drivable"].argmax(1)
 
         for i in range(imgs.size(0)):
-            drv_ious.append(compute_iou(drv_pred[i], drv_gt[i], num_drivable))
-            lane_ious.append(compute_iou(lane_pred[i], lane_gt[i], num_lane))
+            cm_sem += confusion_matrix(sem_pred[i], sem_gt[i], num_sem, ignore_index)
+            cm_drv += confusion_matrix(drv_pred[i], drv_gt[i], num_drv, ignore_index)
 
-    iou_drv = sum(drv_ious) / len(drv_ious) if drv_ious else 0.0
-    iou_lane = sum(lane_ious) / len(lane_ious) if lane_ious else 0.0
-    mean_iou = 0.5 * (iou_drv + iou_lane)
+    miou_sem, _ = miou_from_cm(cm_sem)
 
-    return {"val_iou_drivable": iou_drv, "val_iou_lane": iou_lane, "val_mean_iou": mean_iou}
+    # drivable: focus on class 1 IoU (drivable pixels)
+    inter = torch.diag(cm_drv).float()
+    union = cm_drv.sum(0).float() + cm_drv.sum(1).float() - inter
+    iou_drv1 = (inter[1] / union[1]).item() if union[1] > 0 else 0.0
+
+    val_score = 0.5 * (miou_sem + iou_drv1)
+    return {"val_miou_sem": miou_sem, "val_iou_drv1": iou_drv1, "val_score": val_score}

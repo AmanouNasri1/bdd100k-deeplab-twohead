@@ -4,24 +4,19 @@ from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
 from torchvision.models.segmentation.deeplabv3 import DeepLabHead
 
 class DeepLabV3TwoHead(nn.Module):
-    def __init__(self, pretrained: bool, num_drivable: int, num_lane: int):
+    def __init__(self, pretrained: bool, num_semantic: int, num_drivable: int):
         super().__init__()
         base = deeplabv3_mobilenet_v3_large(weights="DEFAULT" if pretrained else None)
-        self.backbone = base.backbone  # returns dict {"out": tensor}
-
-        # MobileNetV3 DeepLab uses 960 channels at out
+        self.backbone = base.backbone
         in_ch = 960
-        self.head_drivable = DeepLabHead(in_ch, num_drivable)
-        self.head_lane = DeepLabHead(in_ch, num_lane)
+        self.head_sem = DeepLabHead(in_ch, num_semantic)
+        self.head_drv = DeepLabHead(in_ch, num_drivable)
 
     def forward(self, x):
         input_shape = x.shape[-2:]
         feats = self.backbone(x)["out"]
-
-        out_d = self.head_drivable(feats)
-        out_l = self.head_lane(feats)
-
-        out_d = F.interpolate(out_d, size=input_shape, mode="bilinear", align_corners=False)
-        out_l = F.interpolate(out_l, size=input_shape, mode="bilinear", align_corners=False)
-
-        return {"drivable": out_d, "lane": out_l}
+        sem = self.head_sem(feats)
+        drv = self.head_drv(feats)
+        sem = F.interpolate(sem, size=input_shape, mode="bilinear", align_corners=False)
+        drv = F.interpolate(drv, size=input_shape, mode="bilinear", align_corners=False)
+        return {"semantic": sem, "drivable": drv}
